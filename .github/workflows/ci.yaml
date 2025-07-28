@@ -31,6 +31,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install .[dev]
 
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install dataform CLI
+      run: npm install -g @dataform/cli
+
     - name: Check formatting
       run: poe format --check
 
