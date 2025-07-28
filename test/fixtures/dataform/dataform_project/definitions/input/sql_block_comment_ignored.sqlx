@@ -1,0 +1,16 @@
+config {
+    type: "view"
+}
+
+/* the block below should be ignored */
+
+/*
+    select * from ${ ref('NO_SUCH_TABLE') }
+*/
+
+with regular as (
+    select * from ${ ref("table_a") }
+)
+select *
+from regular
+where regular.some_column = 'line_comment_test'

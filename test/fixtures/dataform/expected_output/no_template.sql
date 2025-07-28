@@ -1,0 +1,5 @@
+
+
+select 'no templating in this query' as message
+from static_project.static_dataset.static_table
+where is_templating = false

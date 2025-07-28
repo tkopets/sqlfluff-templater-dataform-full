@@ -1,0 +1,5 @@
+dataformCoreVersion: 3.0.17
+defaultProject: project
+defaultLocation: us
+defaultDataset: dataform
+defaultAssertionDataset: dataform_assertions

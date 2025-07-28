@@ -1,0 +1,25 @@
+config {
+    type: "view"
+}
+
+js {
+    const filter_value = 'config_js_query';
+}
+
+with regular as (
+    select * from ${ ref("table_a") }
+),
+templated_str as (
+    ${ utils.select_star_template(ref("table_b")) }
+)
+select *
+from regular
+    inner join templated_str
+        on regular.some_id = templated_str.some_id
+where regular.some_column = '${ filter_value }'
+
+js {
+    const other_filter_value = 'after_second_js_block';
+}
+
+    and regular.other_column = '${ other_filter_value }'

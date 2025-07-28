@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=40.8.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sqlfluff-templater-dataform-full"
+version = "0.1.0"
+requires-python = ">=3.9"
+description = "Lint your Dataform project SQL"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = "MIT"
+authors = [
+    {name = "Taras Kopets", email = "tkopets@gmail.com"},
+]
+classifiers = [
+    "Environment :: Console",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: Unix",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Utilities",
+    "Topic :: Software Development :: Quality Assurance",
+]
+keywords = [
+    "sqlfluff",
+    "sql",
+    "linter",
+    "formatter",
+    "bigquery",
+    "dataform",
+    "templater",
+]
+dependencies = [
+    "sqlfluff>=3.4.2",
+    "typing-extensions>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy", "poethepoet", "build"]
+
+
+[project.entry-points.sqlfluff]
+sqlfluff_templater_dataform_full = "sqlfluff_templater_dataform_full"
+
+[tool.poe.tasks]
+test = "pytest"
+lint = "ruff check ."
+format = "ruff format ."
+type-check = "mypy ."
+check = ["lint", "type-check", "test"]
+build = "python -m build"
+
+[tool.poe.tasks.fix]
+sequence = [
+    { cmd = "ruff check . --fix" },
+    { cmd = "ruff format ." }
+]
+ignore_fail = true
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "C4", "B", "A", "UP", "N", "YTT", "S", "BLE", "FBT", "ERA", "PIE", "T20", "PYI", "PT", "RSE", "SLF", "RUF"]
+ignore = ["B008", "S101", "S603"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = ["build", ".venv", ".ruff_cache"]
+
+[tool.basedpyright]
+exclude = [ "**/__pycache__", "build", ".ruff_cache"]
+pythonVersion = "3.9"

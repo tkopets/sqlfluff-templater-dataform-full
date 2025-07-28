@@ -1,0 +1,6 @@
+config {
+  type: "declaration",
+  database: "project",
+  schema: "dataset",
+  name: "table_a"
+}
