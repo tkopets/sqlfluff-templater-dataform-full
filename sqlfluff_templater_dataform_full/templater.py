@@ -403,6 +403,9 @@ class DataformTemplaterFull(RawTemplater):
         """Copies necessary Dataform project files to the temp compilation directory."""
         templater_logger.info("Created temporary project directory: %s", temp_dir)
 
+        if (project_dir / "package.json").exists():
+            shutil.copy2(project_dir / "package.json", temp_dir / "package.json")
+            templater_logger.debug("Copied package.json")
         if (project_dir / "dataform.json").exists():
             shutil.copy2(project_dir / "dataform.json", temp_dir / "dataform.json")
             templater_logger.debug("Copied dataform.json")
@@ -427,6 +430,29 @@ class DataformTemplaterFull(RawTemplater):
         """
         Executes the `dataform compile` command and returns the parsed JSON output.
         """
+        if (temp_dir / "package.json").exists():
+            templater_logger.info("Found package.json, running `npm install`...")
+            try:
+                npm_executable = shutil.which("npm")
+                if not npm_executable:
+                    raise FileNotFoundError("npm not found")
+                subprocess.run(
+                    [npm_executable, "install", "--production"],
+                    cwd=temp_dir,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                npm_stderr: Optional[str] = None
+                if isinstance(e, subprocess.CalledProcessError):
+                    npm_stderr = e.stderr
+                raise SQLFluffUserError(
+                    "Failed to run `npm install`. "
+                    + f"Is `npm` installed and on the PATH?\nError: {e}\n"
+                    + f"Stderr: {npm_stderr if npm_stderr else 'N/A'}"
+                ) from e
+
         dataform_executable = self._get_dataform_executable(config)
         templater_logger.info("Running `dataform compile`...")
         try:
