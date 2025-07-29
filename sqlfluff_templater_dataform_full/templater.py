@@ -117,11 +117,14 @@ class DataformTemplaterFull(RawTemplater):
             config_section_val = config.get_section(  # pyright:ignore[reportAny]
                 (self.templater_selector, self.name, "dataform_executable")
             )
-        return (
+        dataform_executable = (
             str(config_section_val)  # pyright:ignore[reportAny]
             if config_section_val is not None
             else os.getenv("DATAFORM_EXECUTABLE") or "dataform"
         )
+        templater_logger.debug(f"Using dataform executable: {dataform_executable}")
+
+        return dataform_executable
 
     def _get_project_dir(self, config: Optional[FluffConfig]) -> str:
         """Get Dataform project directory from the configuration.
@@ -401,28 +404,25 @@ class DataformTemplaterFull(RawTemplater):
 
     def _copy_project_files_to_temp_dir(self, project_dir: Path, temp_dir: Path):
         """Copies necessary Dataform project files to the temp compilation directory."""
-        templater_logger.info("Created temporary project directory: %s", temp_dir)
 
-        if (project_dir / "package.json").exists():
-            shutil.copy2(project_dir / "package.json", temp_dir / "package.json")
-            templater_logger.debug("Copied package.json")
-        if (project_dir / "dataform.json").exists():
-            shutil.copy2(project_dir / "dataform.json", temp_dir / "dataform.json")
-            templater_logger.debug("Copied dataform.json")
-        if (project_dir / "workflow_settings.yaml").exists():
-            shutil.copy2(
-                project_dir / "workflow_settings.yaml",
-                temp_dir / "workflow_settings.yaml",
-            )
-            templater_logger.debug("Copied workflow_settings.yaml")
-        includes_path = project_dir / "includes"
-        if includes_path.exists():
-            shutil.copytree(includes_path, temp_dir / "includes")
-            templater_logger.debug("Copied includes/ directory")
-        definitions_path = project_dir / "definitions"
-        if definitions_path.exists():
-            shutil.copytree(definitions_path, temp_dir / "definitions")
-            templater_logger.debug("Copied definitions/ directory")
+        def copy_file(filename):
+            copy_project_file = project_dir / filename
+            if (copy_project_file).exists():
+                shutil.copy2(copy_project_file, temp_dir / filename)
+                templater_logger.debug(f"Copied {filename}")
+
+        def copy_dir(dirname):
+            copy_project_dir = project_dir / dirname
+            if copy_project_dir.exists():
+                shutil.copytree(copy_project_dir, temp_dir / dirname)
+                templater_logger.debug(f"Copied {dirname}/ directory")
+
+        copy_file("package.json")
+        copy_file("package-lock.json")
+        copy_file("dataform.json")
+        copy_file("workflow_settings.yaml")
+        copy_dir("includes")
+        copy_dir("definitions")
 
     def _execute_dataform_compile(
         self, temp_dir: Path, config: Optional[FluffConfig]
@@ -453,11 +453,19 @@ class DataformTemplaterFull(RawTemplater):
                     + f"Stderr: {npm_stderr if npm_stderr else 'N/A'}"
                 ) from e
 
-        dataform_executable = self._get_dataform_executable(config)
-        templater_logger.info("Running `dataform compile`...")
         try:
+            dataform_executable = self._get_dataform_executable(config)
+            found_dataform_executable = shutil.which(dataform_executable)
+            if not found_dataform_executable:
+                raise FileNotFoundError(
+                    f'Dataform executable "{dataform_executable}" not found'
+                )
+            templater_logger.debug(
+                f"Found dataform executable: {found_dataform_executable}"
+            )
+            templater_logger.info("Running `dataform compile`...")
             compile_process = subprocess.run(
-                [dataform_executable, "compile", "--json"],
+                args=[Path(found_dataform_executable).absolute(), "compile", "--json"],
                 cwd=temp_dir,
                 capture_output=True,
                 text=True,
@@ -681,6 +689,7 @@ class DataformTemplaterFull(RawTemplater):
         templater_logger.info("Starting Dataform compilation...")
         with tempfile.TemporaryDirectory() as temp_dir_str:
             temp_dir = Path(temp_dir_str)
+            templater_logger.info("Created temporary project directory: %s", temp_dir)
 
             self._copy_project_files_to_temp_dir(project_dir, temp_dir)
 
