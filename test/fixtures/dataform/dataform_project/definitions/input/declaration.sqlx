@@ -1,0 +1,9 @@
+config {
+  type: "declaration",
+  database: "project",
+  schema: "dataset",
+  name: "table_x"
+}
+
+-- This is a comment that should be preserved.
+-- TODO: Check if this linting works.

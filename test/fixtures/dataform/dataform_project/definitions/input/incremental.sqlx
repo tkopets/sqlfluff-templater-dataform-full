@@ -1,0 +1,5 @@
+config {
+  type: "incremental"
+}
+-- This inserts `1` the first time running, and `2` on subsequent runs.
+SELECT ${when(incremental(), 1, 2) } AS col

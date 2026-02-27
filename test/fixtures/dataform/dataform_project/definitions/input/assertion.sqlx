@@ -1,0 +1,5 @@
+config {
+  type: "assertion"
+}
+
+SELECT * FROM ${ref("table_a")} WHERE col IS NULL
