@@ -1,0 +1,17 @@
+config {
+  type: "table"
+}
+
+pre_operations {
+  GRANT `roles/bigquery.dataViewer`
+  ON TABLE ${ref("table_a")}
+  TO "group:automation@example.com"
+}
+
+post_operations {
+  REVOKE `roles/bigquery.dataViewer`
+  ON TABLE ${ref("table_a")}
+  TO "group:automation@example.com"
+}
+
+SELECT 1 AS test

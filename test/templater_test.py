@@ -42,6 +42,11 @@ def _run_templater_and_verify_result(
         "no_template.sqlx",
         "sql_line_comment_ignored.sqlx",
         "sql_block_comment_ignored.sqlx",
+        "pre_post_ops.sqlx",
+        "incremental.sqlx",
+        "assertion.sqlx",
+        "declaration.sqlx",
+        "test_case.sqlx",
     ],
 )
 def test__templater_dataform_templating_result(

@@ -45,11 +45,24 @@ class DataformCompiledTable(TypedDict):
 DataformCompiledAssertion = DataformCompiledTable
 
 
+class DataformCompiledDeclaration(TypedDict):
+    """Represents a single compiled declaration object from Dataform."""
+
+    fileName: str
+
+
 class DataformCompiledOperation(TypedDict):
     """Represents a single compiled object (table, assertion, etc.) from Dataform."""
 
     fileName: str
     queries: list[str]
+
+
+class DataformCompiledTest(TypedDict):
+    """Represents a single compiled test object from Dataform."""
+
+    fileName: str
+    expectedOutputQuery: str
 
 
 class DataformCompilationResult(TypedDict):
@@ -58,6 +71,8 @@ class DataformCompilationResult(TypedDict):
     tables: NotRequired[list[DataformCompiledTable]]
     assertions: NotRequired[list[DataformCompiledAssertion]]
     operations: NotRequired[list[DataformCompiledOperation]]
+    declarations: NotRequired[list[DataformCompiledDeclaration]]
+    tests: NotRequired[list[DataformCompiledTest]]
 
 
 class BlockType(str, Enum):
@@ -65,6 +80,7 @@ class BlockType(str, Enum):
     JS = "js"
     PRE_OPERATIONS = "pre_operations"
     POST_OPERATIONS = "post_operations"
+    INPUT = "input"
     TEMPLATED = "templated"
     SQL_LINE_COMMENT = "comment_line"
     SQL_BLOCK_COMMENT = "comment_block"
@@ -85,6 +101,7 @@ class CompilationCache:
 
     blocks: list[BlockSpan]
     compiled_sql: str
+    raw_source: str
 
 
 @final
@@ -163,7 +180,7 @@ class DataformTemplaterFull(RawTemplater):
         # - ${...} templated blocks (handles nested braces)
         # - SQL line and block comments
         block_regex = re.compile(
-            r"(?P<block_type_outer>config|js|pre_operations|post_operations)\s*\{(?P<block_content>(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}|"
+            r"(?P<block_type_outer>config|js|pre_operations|post_operations|input)\s*(?P<block_args>\"[^\"]+\")?\s*\{(?P<block_content>(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}|"
             r"(?P<templated_block>\$\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})|"
             r"(?P<comment_block>/\*.*?\*/)|"
             r"(?P<comment_line>--.*?(?=\n|$))",
@@ -284,51 +301,63 @@ class DataformTemplaterFull(RawTemplater):
                         i += len(test_prefix) - 1
                         matched = True
                         break
-                    if not matched:  # if no higher-priority block matched
-                        # check for SQL block comments /* ... */
-                        if raw_str.startswith("/*", i):
-                            outer_start = i
-                            comment_end_marker_idx = raw_str.find("*/", i + 2)
 
-                            if comment_end_marker_idx != -1:
-                                outer_end = comment_end_marker_idx + 2
-                            else:
-                                outer_end = len(raw_str)  # unclosed block comment
+                if not matched and raw_str.startswith("input", i):
+                    input_match = re.match(r'input\s+"[^"]+"\s*\{', raw_str[i:])
+                    if input_match:
+                        stack = 1
+                        block_type = BlockType.INPUT
+                        outer_block_start = i
+                        matched_len = input_match.end()
+                        inner_content_start = i + matched_len
+                        i += matched_len - 1
+                        matched = True
 
-                            results.append(
-                                BlockSpan(
-                                    outer_start,
-                                    outer_start,
-                                    outer_end,
-                                    outer_end,
-                                    BlockType.SQL_BLOCK_COMMENT,
-                                )
+                if not matched:  # if no higher-priority block matched
+                    # check for SQL block comments /* ... */
+                    if raw_str.startswith("/*", i):
+                        outer_start = i
+                        comment_end_marker_idx = raw_str.find("*/", i + 2)
+
+                        if comment_end_marker_idx != -1:
+                            outer_end = comment_end_marker_idx + 2
+                        else:
+                            outer_end = len(raw_str)  # unclosed block comment
+
+                        results.append(
+                            BlockSpan(
+                                outer_start,
+                                outer_start,
+                                outer_end,
+                                outer_end,
+                                BlockType.SQL_BLOCK_COMMENT,
                             )
-                            # adjust for the i += 1 at the end of loop
-                            i = outer_end - 1
+                        )
+                        # adjust for the i += 1 at the end of loop
+                        i = outer_end - 1
 
-                        # check for SQL line comments -- ...
-                        elif raw_str.startswith("--", i):
-                            outer_start = i
-                            newline_idx = raw_str.find("\n", i + 2)
+                    # check for SQL line comments -- ...
+                    elif raw_str.startswith("--", i):
+                        outer_start = i
+                        newline_idx = raw_str.find("\n", i + 2)
 
-                            if newline_idx != -1:
-                                outer_end = newline_idx
-                            else:
-                                # Line comment goes to end of string
-                                outer_end = len(raw_str)
+                        if newline_idx != -1:
+                            outer_end = newline_idx
+                        else:
+                            # Line comment goes to end of string
+                            outer_end = len(raw_str)
 
-                            results.append(
-                                BlockSpan(
-                                    outer_start,
-                                    outer_start,
-                                    outer_end,
-                                    outer_end,
-                                    BlockType.SQL_LINE_COMMENT,
-                                )
+                        results.append(
+                            BlockSpan(
+                                outer_start,
+                                outer_start,
+                                outer_end,
+                                outer_end,
+                                BlockType.SQL_LINE_COMMENT,
                             )
-                            # adjust for the i += 1 at the end of loop
-                            i = outer_end - 1
+                        )
+                        # adjust for the i += 1 at the end of loop
+                        i = outer_end - 1
 
             # if in a block, count all braces
             else:
@@ -492,8 +521,10 @@ class DataformTemplaterFull(RawTemplater):
             ) from e
 
     def _extract_compiled_query(
-        self, compile_result: DataformCompilationResult, original_fname_path: Path
-    ) -> str:
+        self,
+        compile_result: DataformCompilationResult,
+        original_fname_path: Path,
+    ) -> Optional[str]:
         """
         Extracts the compiled SQL query for the target file from the Dataform
         compilation result.
@@ -506,6 +537,8 @@ class DataformTemplaterFull(RawTemplater):
             ((obj, "table") for obj in compile_result.get("tables", [])),
             ((obj, "assertion") for obj in compile_result.get("assertions", [])),
             ((obj, "operation") for obj in compile_result.get("operations", [])),
+            ((obj, "declaration") for obj in compile_result.get("declarations", [])),
+            ((obj, "test") for obj in compile_result.get("tests", [])),
         )
         for compiled_obj, obj_type in compiled_objects:
             output_file_name = Path(compiled_obj["fileName"])
@@ -516,20 +549,34 @@ class DataformTemplaterFull(RawTemplater):
                     )
                     if queries:
                         compiled_sql = "".join(queries)
+                elif obj_type == "declaration":
+                    # Declarations have no compiled SQL, so we return None to indicate
+                    # that the caller should handle reconstruction.
+                    return None
+                elif obj_type == "test":
+                    compiled_sql = cast(DataformCompiledTest, compiled_obj).get(
+                        "expectedOutputQuery"
+                    )
                 else:
                     compiled_sql = cast(DataformCompiledTable, compiled_obj).get(
                         "query"
                     )
 
+                # Found the object, return its SQL (or None if not found/empty)
+                if compiled_sql is not None:
+                    templater_logger.debug(
+                        f"Extracted compiled SQL: {compiled_sql[:100]}..."
+                    )
+                    return compiled_sql
+                # If we found the object but it had no SQL (and wasn't a declaration),
+                # we continue searching (though this shouldn't happen for valid
+                # Dataform output)
                 break
 
-        if not compiled_sql:
-            raise SQLTemplaterError(
-                f"Could not find compiled SQL for file {str(original_fname_path)!r} "
-                + "in Dataform output."
-            )
-        templater_logger.debug(f"Extracted compiled SQL: {compiled_sql[:100]}...")
-        return compiled_sql
+        raise SQLTemplaterError(
+            f"Could not find compiled SQL for file {str(original_fname_path)!r} "
+            + "in Dataform output."
+        )
 
     def _add_literal_slices(
         self,
@@ -620,7 +667,13 @@ class DataformTemplaterFull(RawTemplater):
                 current_source_pos = block_span.outer_end
                 current_templated_pos += len(templated_content_compiled)
                 next_compiled_marker_match = next(compiled_marker_iter, None)
-            elif block_span.block_type in (BlockType.CONFIG, BlockType.JS):
+            elif block_span.block_type in (
+                BlockType.CONFIG,
+                BlockType.JS,
+                BlockType.PRE_OPERATIONS,
+                BlockType.POST_OPERATIONS,
+                BlockType.INPUT,
+            ):
                 raw_file_slices.append(
                     RawFileSlice(
                         original_block_full_text,
@@ -668,6 +721,23 @@ class DataformTemplaterFull(RawTemplater):
 
         return final_templated_str, raw_file_slices, templated_file_slices
 
+    def _reconstruct_declaration_sql(
+        self, raw_source: str, blocks: list[BlockSpan]
+    ) -> str:
+        """Reconstruct declaration SQL by preserving only literal parts and comments."""
+        parts: list[str] = []
+        last_pos = 0
+        for block in blocks:
+            parts.append(raw_source[last_pos : block.outer_start])
+            if block.block_type in (
+                BlockType.SQL_LINE_COMMENT,
+                BlockType.SQL_BLOCK_COMMENT,
+            ):
+                parts.append(raw_source[block.outer_start : block.outer_end])
+            last_pos = block.outer_end
+        parts.append(raw_source[last_pos:])
+        return "".join(parts)
+
     def _compile_files(
         self,
         fnames: list[str],
@@ -711,7 +781,7 @@ class DataformTemplaterFull(RawTemplater):
 
                 all_blocks = self._find_template_blocks(in_str, config)
                 self._compilation_cache[fname] = CompilationCache(
-                    blocks=all_blocks, compiled_sql=""
+                    blocks=all_blocks, compiled_sql="", raw_source=in_str
                 )
 
                 transformed_sqlx = self._annotate_sqlx_with_markers(
@@ -723,9 +793,20 @@ class DataformTemplaterFull(RawTemplater):
 
             for fname in fnames:
                 fname_path = Path(fname).resolve()
+                cache_entry = self._compilation_cache[fname]
+
                 compiled_sql = self._extract_compiled_query(
-                    compile_result, fname_path.relative_to(project_dir)
+                    compile_result,
+                    fname_path.relative_to(project_dir),
                 )
+
+                if compiled_sql is None:
+                    # If None returned, it's a declaration file (no compiled SQL).
+                    # We reconstruct it by stripping dataform blocks.
+                    compiled_sql = self._reconstruct_declaration_sql(
+                        cache_entry.raw_source, cache_entry.blocks
+                    )
+
                 self._compilation_cache[fname].compiled_sql = compiled_sql
         templater_logger.info("Dataform compilation finished.")
 

@@ -1,0 +1,14 @@
+config {
+  type: "test",
+  dataset: "config_query"
+}
+
+input "table_a" {
+  SELECT 'config_query' AS some_column, 1 AS some_id
+}
+
+input "table_b" {
+  SELECT 1 AS some_id
+}
+
+SELECT 'config_query' AS some_column, 1 AS some_id
