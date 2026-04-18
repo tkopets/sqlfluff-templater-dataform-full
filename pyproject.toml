@@ -73,6 +73,10 @@ warn_unused_configs = true
 ignore_missing_imports = true
 exclude = ["build", ".venv", ".ruff_cache"]
 
+[[tool.mypy.overrides]]
+module = ["_pytest.*", "pytest.*"]
+follow_imports = "skip"
+
 [tool.basedpyright]
 exclude = [ "**/__pycache__", "build", ".ruff_cache"]
 pythonVersion = "3.9"
