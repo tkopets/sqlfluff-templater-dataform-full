@@ -95,6 +95,42 @@ class BlockSpan:
     block_type: BlockType
 
 
+# --- Lexer for the "lexer" parsing method -----------------------------------
+# States for `_find_template_blocks_by_lexer`. SQL is the top level; INNER_SQL is
+# an opaque `pre_operations` / `post_operations` / `input` block (left for
+# Dataform, so its `${}` are not templated here); JS is a `config`/`js`/`${}`
+# body; TMPL is a JS template literal; STR_* are SQL string literals (which may
+# contain `${}`).
+_LEX_SQL = 0
+_LEX_INNER_SQL = 1
+_LEX_JS = 2
+_LEX_TMPL = 3
+_LEX_STR_SQ = 4
+_LEX_STR_DQ = 5
+_LEX_STR_TSQ = 6
+_LEX_STR_TDQ = 7
+
+# Top-level block openers, tried in this order. Whitespace before `{` is flexible
+# to match the previous regex finder. Recognized only in bare SQL (not inside
+# strings/comments/other blocks), so a keyword inside a string cannot open one.
+_LEX_STARTERS: list[tuple["re.Pattern[str]", BlockType]] = [
+    (re.compile(r"config\s*\{"), BlockType.CONFIG),
+    (re.compile(r"js\s*\{"), BlockType.JS),
+    (re.compile(r"pre_operations\s*\{"), BlockType.PRE_OPERATIONS),
+    (re.compile(r"post_operations\s*\{"), BlockType.POST_OPERATIONS),
+    (re.compile(r'input\s+"[^"]+"\s*\{'), BlockType.INPUT),
+]
+
+# JS string literals, matched whole so a `}`, `` ` `` or `{` inside cannot shift
+# the brace count. No newline inside; only \' \" \\ escapes (as Dataform lexes).
+_LEX_JS_SQ_STR = re.compile(r"'(?:\\['\\]|[^\n'\\])*'")
+_LEX_JS_DQ_STR = re.compile(r'"(?:\\["\\]|[^\n"\\])*"')
+
+# `\${` followed by a backtick: an escaped-interpolation artifact of Dataform's
+# template-literal lexer, consumed whole so it neither opens nor closes a literal.
+_LEX_TMPL_ESCAPED = "\\${`"
+
+
 @dataclass
 class CompilationCache:
     """Caches compilation artifacts for a file."""
@@ -245,23 +281,25 @@ class DataformTemplaterFull(RawTemplater):
         """
         Finds all template blocks in the raw string, using the configured parsing method
         """
-        parsing_method = "regex"
+        parsing_method = "lexer"
         if config:
             parsing_method = (
                 config.get_section(
                     (self.templater_selector, self.name, "parsing_method")
                 )
-                or "regex"
+                or "lexer"
             )
 
-        if parsing_method == "regex":
+        if parsing_method == "lexer":
+            return self._find_template_blocks_by_lexer(raw_str)
+        elif parsing_method == "regex":
             return self._find_template_blocks_by_regex(raw_str)
         elif parsing_method == "char":
             return self._find_template_blocks_by_char(raw_str)
         else:
             raise SQLFluffUserError(
                 f"Invalid 'parsing_method' for dataform templater: {parsing_method}. "
-                + "Expected 'regex' or 'char'."
+                + "Expected 'lexer', 'regex' or 'char'."
             )
 
     def _find_template_blocks_by_char(self, raw_str: str) -> list[BlockSpan]:
@@ -384,6 +422,241 @@ class DataformTemplaterFull(RawTemplater):
                         outer_block_start = -1
             i += 1
         templater_logger.debug(f"Found {len(results)} blocks.")
+        return results
+
+    def _find_template_blocks_by_lexer(self, raw_str: str) -> list[BlockSpan]:
+        """
+        Finds `${...}`, `config`/`js`, `pre_operations`/`post_operations`,
+        `input` and comment blocks using a context-tracking lexer.
+
+        Unlike the `regex` and `char` methods, this tracks lexical context (SQL
+        and JS strings, template literals, comments), so a brace, `${` or comment
+        marker that appears *inside* a string or comment cannot mis-terminate a
+        block. `${}` is templated at the top level and inside SQL string literals
+        (all quote flavors), but left verbatim inside comments and inside
+        `config`/`js`/`pre_operations`/`post_operations`/`input` blocks, matching
+        how Dataform interpolates the file.
+        """
+        results: list[BlockSpan] = []
+        n = len(raw_str)
+
+        # Each stack frame is (state, region). `region` is set only on the frame
+        # that roots an emitted block -- (block_type, outer_start, inner_start);
+        # the block is emitted when that frame is popped by its matching `}`.
+        stack: list[tuple[int, Optional[tuple[BlockType, int, int]]]] = [
+            (_LEX_SQL, None)
+        ]
+        # `suppress` > 0 while inside any block or opaque inner-SQL region: no new
+        # block or comment may open, and `${}` is not separately templated.
+        suppress = 0
+
+        def open_templated(pos: int) -> None:
+            nonlocal suppress
+            if suppress == 0:
+                stack.append((_LEX_JS, (BlockType.TEMPLATED, pos, pos + 2)))
+                suppress += 1
+            else:
+                stack.append((_LEX_JS, None))
+
+        i = 0
+        while i < n:
+            state = stack[-1][0]
+            c = raw_str[i]
+            nxt = raw_str[i + 1 : i + 2]
+
+            if state in (_LEX_SQL, _LEX_INNER_SQL):
+                if state == _LEX_SQL:
+                    matched = False
+                    for pattern, block_type in _LEX_STARTERS:
+                        m = pattern.match(raw_str, i)
+                        if m:
+                            new_state = (
+                                _LEX_JS
+                                if block_type in (BlockType.CONFIG, BlockType.JS)
+                                else _LEX_INNER_SQL
+                            )
+                            stack.append((new_state, (block_type, i, m.end())))
+                            suppress += 1
+                            i = m.end()
+                            matched = True
+                            break
+                    if matched:
+                        continue
+
+                # `--` line comment / `---` separator and `/* ... */` block
+                # comment both run to their end and protect any `${}` inside.
+                if c == "-" and nxt == "-":
+                    nl = raw_str.find("\n", i + 2)
+                    end = n if nl == -1 else nl
+                    if suppress == 0:
+                        results.append(
+                            BlockSpan(i, i, end, end, BlockType.SQL_LINE_COMMENT)
+                        )
+                    i = end
+                    continue
+                if c == "/" and nxt == "*":
+                    idx = raw_str.find("*/", i + 2)
+                    end = n if idx == -1 else idx + 2
+                    if suppress == 0:
+                        results.append(
+                            BlockSpan(i, i, end, end, BlockType.SQL_BLOCK_COMMENT)
+                        )
+                    i = end
+                    continue
+                if c == "$" and nxt == "{":
+                    open_templated(i)
+                    i += 2
+                    continue
+                if state == _LEX_INNER_SQL and c == "}":
+                    _, region = stack.pop()
+                    suppress -= 1
+                    if region is not None:
+                        bt, outer_start, inner_start = region
+                        results.append(
+                            BlockSpan(outer_start, inner_start, i, i + 1, bt)
+                        )
+                    i += 1
+                    continue
+                if c == "`":
+                    # Backtick-quoted identifier delimiter: a `${}` inside is
+                    # still interpolated, so keep scanning in this state.
+                    i += 1
+                    continue
+                if raw_str.startswith("'''", i):
+                    stack.append((_LEX_STR_TSQ, None))
+                    i += 3
+                    continue
+                if raw_str.startswith('"""', i):
+                    stack.append((_LEX_STR_TDQ, None))
+                    i += 3
+                    continue
+                if c == "'":
+                    stack.append((_LEX_STR_SQ, None))
+                    i += 1
+                    continue
+                if c == '"':
+                    stack.append((_LEX_STR_DQ, None))
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            if state == _LEX_JS:
+                if c == "/" and nxt == "/":
+                    nl = raw_str.find("\n", i + 2)
+                    i = n if nl == -1 else nl
+                    continue
+                if c == "/" and nxt == "*":
+                    idx = raw_str.find("*/", i + 2)
+                    i = n if idx == -1 else idx + 2
+                    continue
+                if c in ("'", '"'):
+                    pattern = _LEX_JS_SQ_STR if c == "'" else _LEX_JS_DQ_STR
+                    m = pattern.match(raw_str, i)
+                    i = m.end() if m else i + 1
+                    continue
+                if c == "`":
+                    stack.append((_LEX_TMPL, None))
+                    i += 1
+                    continue
+                if c == "{":
+                    stack.append((_LEX_JS, None))
+                    i += 1
+                    continue
+                if c == "}":
+                    _, region = stack.pop()
+                    if region is not None:
+                        suppress -= 1
+                        bt, outer_start, inner_start = region
+                        results.append(
+                            BlockSpan(outer_start, inner_start, i, i + 1, bt)
+                        )
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            if state == _LEX_TMPL:
+                if c == "\\" and nxt == "\\":
+                    i += 2
+                    continue
+                if raw_str.startswith(_LEX_TMPL_ESCAPED, i):
+                    i += len(_LEX_TMPL_ESCAPED)
+                    continue
+                if c == "$" and nxt == "{":
+                    stack.append((_LEX_JS, None))
+                    i += 2
+                    continue
+                if c == "`":
+                    stack.pop()
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            if state == _LEX_STR_SQ:
+                if c == "\\" and nxt in ("\\", "'"):
+                    i += 2
+                    continue
+                if c == "$" and nxt == "{":
+                    open_templated(i)
+                    i += 2
+                    continue
+                if c == "'":
+                    stack.pop()
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            if state == _LEX_STR_DQ:
+                if c == "\\" and nxt in ("\\", '"'):
+                    i += 2
+                    continue
+                if c == "$" and nxt == "{":
+                    open_templated(i)
+                    i += 2
+                    continue
+                if c == '"':
+                    stack.pop()
+                    i += 1
+                    continue
+                i += 1
+                continue
+
+            if state == _LEX_STR_TSQ:
+                if c == "\\" and nxt == "\\":
+                    i += 2
+                    continue
+                if c == "$" and nxt == "{":
+                    open_templated(i)
+                    i += 2
+                    continue
+                if raw_str.startswith("'''", i):
+                    stack.pop()
+                    i += 3
+                    continue
+                i += 1
+                continue
+
+            # _LEX_STR_TDQ
+            if c == "\\" and nxt == "\\":
+                i += 2
+                continue
+            if c == "$" and nxt == "{":
+                open_templated(i)
+                i += 2
+                continue
+            if raw_str.startswith('"""', i):
+                stack.pop()
+                i += 3
+                continue
+            i += 1
+
+        # Emitted at close, so already ordered, but sort defensively; unterminated
+        # blocks (never popped) simply emit nothing, matching the other methods.
+        results.sort(key=lambda b: b.outer_start)
+        templater_logger.debug(f"Found {len(results)} blocks (lexer).")
         return results
 
     def _annotate_sqlx_with_markers(
