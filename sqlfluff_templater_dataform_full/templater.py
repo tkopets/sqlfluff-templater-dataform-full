@@ -99,16 +99,16 @@ class BlockSpan:
 # States for `_find_template_blocks_by_lexer`. SQL is the top level; INNER_SQL is
 # an opaque `pre_operations` / `post_operations` / `input` block (left for
 # Dataform, so its `${}` are not templated here); JS is a `config`/`js`/`${}`
-# body; TMPL is a JS template literal; STR_* are SQL string literals (which may
-# contain `${}`).
+# body; TEMPLATE is a JS template literal; STR_* are SQL string literals (which
+# may contain `${}`).
 _LEX_SQL = 0
 _LEX_INNER_SQL = 1
 _LEX_JS = 2
-_LEX_TMPL = 3
-_LEX_STR_SQ = 4
-_LEX_STR_DQ = 5
-_LEX_STR_TSQ = 6
-_LEX_STR_TDQ = 7
+_LEX_TEMPLATE = 3
+_LEX_STR_SINGLE = 4
+_LEX_STR_DOUBLE = 5
+_LEX_STR_TRIPLE_SINGLE = 6
+_LEX_STR_TRIPLE_DOUBLE = 7
 
 # Top-level block openers, as one alternation so a candidate position costs a
 # single match. Whitespace before `{` is flexible to match the previous regex
@@ -135,12 +135,22 @@ _LEX_STARTER_FIRST_CHARS = frozenset(
 
 # JS string literals, matched whole so a `}`, `` ` `` or `{` inside cannot shift
 # the brace count. No newline inside; only \' \" \\ escapes (as Dataform lexes).
-_LEX_JS_SQ_STR = re.compile(r"'(?:\\['\\]|[^\n'\\])*'")
-_LEX_JS_DQ_STR = re.compile(r'"(?:\\["\\]|[^\n"\\])*"')
+_LEX_JS_SINGLE_STR = re.compile(r"'(?:\\['\\]|[^\n'\\])*'")
+_LEX_JS_DOUBLE_STR = re.compile(r'"(?:\\["\\]|[^\n"\\])*"')
 
 # `\${` followed by a backtick: an escaped-interpolation artifact of Dataform's
 # template-literal lexer, consumed whole so it neither opens nor closes a literal.
-_LEX_TMPL_ESCAPED = "\\${`"
+_LEX_TEMPLATE_ESCAPED = "\\${`"
+
+# SQL string literal states -> (closing delimiter, extra escaped char). `\\` and
+# the extra char (the quote, for the single-char flavors) are consumed as escapes;
+# triple-quoted strings only escape `\\`. All flavors interpolate `${...}`.
+_LEX_STR_INFO: dict[int, tuple[str, Optional[str]]] = {
+    _LEX_STR_SINGLE: ("'", "'"),
+    _LEX_STR_DOUBLE: ('"', '"'),
+    _LEX_STR_TRIPLE_SINGLE: ("'''", None),
+    _LEX_STR_TRIPLE_DOUBLE: ('"""', None),
+}
 
 
 @dataclass
@@ -524,9 +534,9 @@ class DataformTemplaterFull(RawTemplater):
                     _, region = stack.pop()
                     suppress -= 1
                     if region is not None:
-                        bt, outer_start, inner_start = region
+                        block_type, outer_start, inner_start = region
                         results.append(
-                            BlockSpan(outer_start, inner_start, i, i + 1, bt)
+                            BlockSpan(outer_start, inner_start, i, i + 1, block_type)
                         )
                     i += 1
                     continue
@@ -536,19 +546,19 @@ class DataformTemplaterFull(RawTemplater):
                     i += 1
                     continue
                 if raw_str.startswith("'''", i):
-                    stack.append((_LEX_STR_TSQ, None))
+                    stack.append((_LEX_STR_TRIPLE_SINGLE, None))
                     i += 3
                     continue
                 if raw_str.startswith('"""', i):
-                    stack.append((_LEX_STR_TDQ, None))
+                    stack.append((_LEX_STR_TRIPLE_DOUBLE, None))
                     i += 3
                     continue
                 if c == "'":
-                    stack.append((_LEX_STR_SQ, None))
+                    stack.append((_LEX_STR_SINGLE, None))
                     i += 1
                     continue
                 if c == '"':
-                    stack.append((_LEX_STR_DQ, None))
+                    stack.append((_LEX_STR_DOUBLE, None))
                     i += 1
                     continue
                 i += 1
@@ -564,12 +574,12 @@ class DataformTemplaterFull(RawTemplater):
                     i = n if idx == -1 else idx + 2
                     continue
                 if c in ("'", '"'):
-                    pattern = _LEX_JS_SQ_STR if c == "'" else _LEX_JS_DQ_STR
+                    pattern = _LEX_JS_SINGLE_STR if c == "'" else _LEX_JS_DOUBLE_STR
                     m = pattern.match(raw_str, i)
                     i = m.end() if m else i + 1
                     continue
                 if c == "`":
-                    stack.append((_LEX_TMPL, None))
+                    stack.append((_LEX_TEMPLATE, None))
                     i += 1
                     continue
                 if c == "{":
@@ -589,12 +599,12 @@ class DataformTemplaterFull(RawTemplater):
                 i += 1
                 continue
 
-            if state == _LEX_TMPL:
+            if state == _LEX_TEMPLATE:
                 if c == "\\" and nxt == "\\":
                     i += 2
                     continue
-                if raw_str.startswith(_LEX_TMPL_ESCAPED, i):
-                    i += len(_LEX_TMPL_ESCAPED)
+                if raw_str.startswith(_LEX_TEMPLATE_ESCAPED, i):
+                    i += len(_LEX_TEMPLATE_ESCAPED)
                     continue
                 if c == "$" and nxt == "{":
                     stack.append((_LEX_JS, None))
@@ -607,62 +617,19 @@ class DataformTemplaterFull(RawTemplater):
                 i += 1
                 continue
 
-            if state == _LEX_STR_SQ:
-                if c == "\\" and nxt in ("\\", "'"):
-                    i += 2
-                    continue
-                if c == "$" and nxt == "{":
-                    open_templated(i)
-                    i += 2
-                    continue
-                if c == "'":
-                    stack.pop()
-                    i += 1
-                    continue
-                i += 1
-                continue
-
-            if state == _LEX_STR_DQ:
-                if c == "\\" and nxt in ("\\", '"'):
-                    i += 2
-                    continue
-                if c == "$" and nxt == "{":
-                    open_templated(i)
-                    i += 2
-                    continue
-                if c == '"':
-                    stack.pop()
-                    i += 1
-                    continue
-                i += 1
-                continue
-
-            if state == _LEX_STR_TSQ:
-                if c == "\\" and nxt == "\\":
-                    i += 2
-                    continue
-                if c == "$" and nxt == "{":
-                    open_templated(i)
-                    i += 2
-                    continue
-                if raw_str.startswith("'''", i):
-                    stack.pop()
-                    i += 3
-                    continue
-                i += 1
-                continue
-
-            # _LEX_STR_TDQ
-            if c == "\\" and nxt == "\\":
+            # SQL string literals (single/double/triple). They differ only by
+            # closing delimiter and which char is escapable, so drive from a table.
+            closer, extra_escape = _LEX_STR_INFO[state]
+            if c == "\\" and (nxt == "\\" or nxt == extra_escape):
                 i += 2
                 continue
             if c == "$" and nxt == "{":
                 open_templated(i)
                 i += 2
                 continue
-            if raw_str.startswith('"""', i):
+            if raw_str.startswith(closer, i):
                 stack.pop()
-                i += 3
+                i += len(closer)
                 continue
             i += 1
 
