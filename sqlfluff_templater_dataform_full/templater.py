@@ -645,8 +645,9 @@ class DataformTemplaterFull(RawTemplater):
         """
         Annotates the SQLX file by wrapping templated blocks with IIFE markers.
 
-        Returns the transformed SQLX string and a map from marker IDs to original
-        inner content of the templated blocks.
+        Returns the transformed SQLX string. Each `${...}` block is wrapped in an
+        IIFE whose output is fenced by unique marker comments (so it can be located
+        in the compiled SQL); all other blocks are passed through unchanged.
         """
         transformed_parts: list[str] = []
         last_idx = 0
