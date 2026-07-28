@@ -110,16 +110,28 @@ _LEX_STR_DQ = 5
 _LEX_STR_TSQ = 6
 _LEX_STR_TDQ = 7
 
-# Top-level block openers, tried in this order. Whitespace before `{` is flexible
-# to match the previous regex finder. Recognized only in bare SQL (not inside
-# strings/comments/other blocks), so a keyword inside a string cannot open one.
-_LEX_STARTERS: list[tuple["re.Pattern[str]", BlockType]] = [
-    (re.compile(r"config\s*\{"), BlockType.CONFIG),
-    (re.compile(r"js\s*\{"), BlockType.JS),
-    (re.compile(r"pre_operations\s*\{"), BlockType.PRE_OPERATIONS),
-    (re.compile(r"post_operations\s*\{"), BlockType.POST_OPERATIONS),
-    (re.compile(r'input\s+"[^"]+"\s*\{'), BlockType.INPUT),
-]
+# Top-level block openers, as one alternation so a candidate position costs a
+# single match. Whitespace before `{` is flexible to match the previous regex
+# finder. Recognized only in bare SQL (not inside strings/comments/other blocks),
+# so a keyword inside a string cannot open one. `kw` captures keyword blocks;
+# a match without it is an `input "..." {` block.
+_LEX_STARTER_RE = re.compile(
+    r"(?P<kw>config|js|pre_operations|post_operations)\s*\{"
+    r'|input\s+"[^"]+"\s*\{'
+)
+_LEX_KEYWORD_BLOCK_TYPE = {
+    "config": BlockType.CONFIG,
+    "js": BlockType.JS,
+    "pre_operations": BlockType.PRE_OPERATIONS,
+    "post_operations": BlockType.POST_OPERATIONS,
+}
+
+# First characters of the openers above, derived so they cannot drift. Most SQL
+# characters are none of these, so gating the starter match on this set skips it
+# for the vast majority of positions.
+_LEX_STARTER_FIRST_CHARS = frozenset(
+    keyword[0] for keyword in (*_LEX_KEYWORD_BLOCK_TYPE, "input")
+)
 
 # JS string literals, matched whole so a `}`, `` ` `` or `{` inside cannot shift
 # the brace count. No newline inside; only \' \" \\ escapes (as Dataform lexes).
@@ -465,22 +477,23 @@ class DataformTemplaterFull(RawTemplater):
             nxt = raw_str[i + 1 : i + 2]
 
             if state in (_LEX_SQL, _LEX_INNER_SQL):
-                if state == _LEX_SQL:
-                    matched = False
-                    for pattern, block_type in _LEX_STARTERS:
-                        m = pattern.match(raw_str, i)
-                        if m:
-                            new_state = (
-                                _LEX_JS
-                                if block_type in (BlockType.CONFIG, BlockType.JS)
-                                else _LEX_INNER_SQL
-                            )
-                            stack.append((new_state, (block_type, i, m.end())))
-                            suppress += 1
-                            i = m.end()
-                            matched = True
-                            break
-                    if matched:
+                if state == _LEX_SQL and c in _LEX_STARTER_FIRST_CHARS:
+                    m = _LEX_STARTER_RE.match(raw_str, i)
+                    if m:
+                        keyword = m.group("kw")
+                        block_type = (
+                            _LEX_KEYWORD_BLOCK_TYPE[keyword]
+                            if keyword is not None
+                            else BlockType.INPUT
+                        )
+                        new_state = (
+                            _LEX_JS
+                            if block_type in (BlockType.CONFIG, BlockType.JS)
+                            else _LEX_INNER_SQL
+                        )
+                        stack.append((new_state, (block_type, i, m.end())))
+                        suppress += 1
+                        i = m.end()
                         continue
 
                 # `--` line comment / `---` separator and `/* ... */` block
