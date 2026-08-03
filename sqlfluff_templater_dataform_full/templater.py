@@ -298,7 +298,10 @@ class DataformTemplaterFull(RawTemplater):
         return results
 
     def _find_template_blocks(
-        self, raw_str: str, config: Optional[FluffConfig]
+        self,
+        raw_str: str,
+        config: Optional[FluffConfig],
+        fname: str = "<string>",
     ) -> list[BlockSpan]:
         """
         Finds all template blocks in the raw string, using the configured parsing method
@@ -313,7 +316,20 @@ class DataformTemplaterFull(RawTemplater):
             )
 
         if parsing_method == "lexer":
-            return self._find_template_blocks_by_lexer(raw_str)
+            blocks, balanced = self._lex(raw_str)
+            if balanced:
+                return blocks
+            # The lexer hit EOF with an unclosed region -- it could not fully make
+            # sense of the file (e.g. an escaped backtick in a template literal, or
+            # a JS regex literal containing backticks). Rather than emit a possibly
+            # mis-sliced result, fall back to the regex parser, which ignores those
+            # constructs. Force parsing_method=regex to skip the lexer entirely.
+            templater_logger.warning(
+                "dataform lexer could not fully parse %s; "
+                "falling back to the regex parser.",
+                fname,
+            )
+            return self._find_template_blocks_by_regex(raw_str)
         elif parsing_method == "regex":
             return self._find_template_blocks_by_regex(raw_str)
         elif parsing_method == "char":
@@ -447,6 +463,10 @@ class DataformTemplaterFull(RawTemplater):
         return results
 
     def _find_template_blocks_by_lexer(self, raw_str: str) -> list[BlockSpan]:
+        """Blocks from the context-tracking lexer (see `_lex`)."""
+        return self._lex(raw_str)[0]
+
+    def _lex(self, raw_str: str) -> tuple[list[BlockSpan], bool]:
         """
         Finds `${...}`, `config`/`js`, `pre_operations`/`post_operations`,
         `input` and comment blocks using a context-tracking lexer.
@@ -458,6 +478,11 @@ class DataformTemplaterFull(RawTemplater):
         (all quote flavors), but left verbatim inside comments and inside
         `config`/`js`/`pre_operations`/`post_operations`/`input` blocks, matching
         how Dataform interpolates the file.
+
+        Returns (blocks, balanced). `balanced` is False when the lexer reached EOF
+        with an unclosed region/string/template -- a signal it could not fully make
+        sense of the file (e.g. an escaped backtick in a template, or a JS regex
+        literal containing backticks). The caller falls back to the regex parser.
         """
         results: list[BlockSpan] = []
         n = len(raw_str)
@@ -636,8 +661,12 @@ class DataformTemplaterFull(RawTemplater):
         # Emitted at close, so already ordered, but sort defensively; unterminated
         # blocks (never popped) simply emit nothing, matching the other methods.
         results.sort(key=lambda b: b.outer_start)
-        templater_logger.debug(f"Found {len(results)} blocks (lexer).")
-        return results
+        # Only the base SQL frame should remain if the file parsed cleanly.
+        balanced = len(stack) == 1
+        templater_logger.debug(
+            f"Found {len(results)} blocks (lexer); balanced={balanced}."
+        )
+        return results, balanced
 
     def _annotate_sqlx_with_markers(
         self, in_str: str, fname: str, all_blocks: list[BlockSpan]
@@ -1033,7 +1062,7 @@ class DataformTemplaterFull(RawTemplater):
                 temp_fpath = temp_dir / relative_fname
                 temp_fpath.parent.mkdir(parents=True, exist_ok=True)
 
-                all_blocks = self._find_template_blocks(in_str, config)
+                all_blocks = self._find_template_blocks(in_str, config, fname)
                 self._compilation_cache[fname] = CompilationCache(
                     blocks=all_blocks, compiled_sql="", raw_source=in_str
                 )

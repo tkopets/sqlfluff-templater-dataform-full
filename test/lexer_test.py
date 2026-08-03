@@ -12,6 +12,7 @@ Two layers:
      correct.
 """
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,14 @@ def _spans(t: DataformTemplaterFull, src: str) -> list[tuple[BlockType, str]]:
         (b.block_type, src[b.outer_start : b.outer_end])
         for b in t._find_template_blocks_by_lexer(src)
     ]
+
+
+@pytest.mark.parametrize("fname", FIXTURES)
+def test_fixtures_lex_cleanly(templater: DataformTemplaterFull, fname: str):
+    """Real fixtures must lex balanced, so the lexer is the active path and does
+    not silently fall back to regex everywhere."""
+    _, balanced = templater._lex((FIXTURE_DIR / fname).read_text())
+    assert balanced
 
 
 @pytest.mark.parametrize("fname", FIXTURES)
@@ -142,3 +151,26 @@ def test_lexer_blocks_are_ordered_and_non_overlapping(
         assert b.outer_start >= prev_end
         assert b.outer_start < b.inner_start <= b.inner_end < b.outer_end
         prev_end = b.outer_end
+
+
+def test_dispatch_falls_back_to_regex_when_lexer_unbalanced(
+    templater: DataformTemplaterFull, caplog
+):
+    """An escaped backtick inside a `${}` expression is a construct the lexer
+    can't model (Dataform compiles it to `select 3 as v`). The raw lexer bails
+    (unbalanced, dropping the placeholder), so the dispatch must notice and fall
+    back to the regex parser, which recovers the placeholder."""
+    src = r"""config { type: "view" }
+select ${ `x\`y`.length } as v"""
+
+    # Raw lexer: unbalanced, and the placeholder is dropped.
+    blocks, balanced = templater._lex(src)
+    assert balanced is False
+    assert BlockType.TEMPLATED not in [b.block_type for b in blocks]
+
+    # Dispatch (config=None -> defaults to lexer) notices and falls back to regex.
+    with caplog.at_level(logging.WARNING, logger="sqlfluff.templater"):
+        dispatched = templater._find_template_blocks(src, None, "model.sqlx")
+    assert BlockType.TEMPLATED in [b.block_type for b in dispatched]
+    assert "falling back to the regex parser" in caplog.text
+    assert "model.sqlx" in caplog.text
