@@ -1,0 +1,12 @@
+config {
+    type: "view"
+}
+
+js {
+    const closing_brace = "}";
+    const filter_value = 'js_block_with_brace_in_string' + closing_brace;
+}
+
+select *
+from ${ ref("table_a") }
+where regular.some_column = '${ filter_value }'
