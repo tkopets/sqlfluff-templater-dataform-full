@@ -95,12 +95,13 @@ class BlockSpan:
     block_type: BlockType
 
 
-# --- Lexer for the "lexer" parsing method -----------------------------------
-# States for `_find_template_blocks_by_lexer`. SQL is the top level; INNER_SQL is
-# an opaque `pre_operations` / `post_operations` / `input` block (left for
-# Dataform, so its `${}` are not templated here); JS is a `config`/`js`/`${}`
-# body; TEMPLATE is a JS template literal; STR_* are SQL string literals (which
-# may contain `${}`).
+# States for the "lexer" parsing method. Kept compatible with Dataform's SQLX
+# lexer, so blocks are detected the way `dataform compile` sees them.
+# SQL is the top level; INNER_SQL is a `pre_operations`/`post_operations`/`input`
+# body; JS is a `config`/`js`/`${}` body; TEMPLATE is a JS template literal;
+# STR_* are SQL string literals. Two deliberate differences: `${}` in a
+# double-quoted SQL string is templated here (see the lexer), and `---` separator
+# spans exclude the surrounding whitespace (harmless -- comments emit no slices).
 _LEX_SQL = 0
 _LEX_INNER_SQL = 1
 _LEX_JS = 2
@@ -111,13 +112,14 @@ _LEX_STR_TRIPLE_SINGLE = 6
 _LEX_STR_TRIPLE_DOUBLE = 7
 
 # Top-level block openers, as one alternation so a candidate position costs a
-# single match. Whitespace before `{` is flexible to match the previous regex
-# finder. Recognized only in bare SQL (not inside strings/comments/other blocks),
-# so a keyword inside a string cannot open one. `kw` captures keyword blocks;
-# a match without it is an `input "..." {` block.
+# single match. `kw` captures keyword blocks; a match without it is `input`.
+# The single literal space before `{` and the `input` charset are Dataform's
+# rules: `config  {` and `config\n{` are not blocks to it, and its compiler
+# relies on that when it slices the body at `"config ".length`. There is also no
+# word-boundary guard, so `nojs {` opens a `js` block, as it does there.
 _LEX_STARTER_RE = re.compile(
-    r"(?P<kw>config|js|pre_operations|post_operations)\s*\{"
-    r'|input\s+"[^"]+"\s*\{'
+    r"(?P<kw>config|js|pre_operations|post_operations) \{"
+    r'|input "[a-zA-Z0-9_-]+"(?:,\s*"[a-zA-Z0-9_-]+")* \{'
 )
 _LEX_KEYWORD_BLOCK_TYPE = {
     "config": BlockType.CONFIG,
@@ -144,7 +146,7 @@ _LEX_TEMPLATE_ESCAPED = "\\${`"
 
 # SQL string literal states -> (closing delimiter, extra escaped char). `\\` and
 # the extra char (the quote, for the single-char flavors) are consumed as escapes;
-# triple-quoted strings only escape `\\`. All flavors interpolate `${...}`.
+# triple-quoted strings only escape `\\`.
 _LEX_STR_INFO: dict[int, tuple[str, Optional[str]]] = {
     _LEX_STR_SINGLE: ("'", "'"),
     _LEX_STR_DOUBLE: ('"', '"'),
@@ -316,173 +318,47 @@ class DataformTemplaterFull(RawTemplater):
             )
 
         if parsing_method == "lexer":
-            blocks, balanced = self._lex(raw_str)
+            blocks, balanced = self._find_template_blocks_by_lexer(raw_str)
             if balanced:
                 return blocks
-            # The lexer hit EOF with an unclosed region -- it could not fully make
-            # sense of the file (e.g. an escaped backtick in a template literal, or
-            # a JS regex literal containing backticks). Rather than emit a possibly
-            # mis-sliced result, fall back to the regex parser, which ignores those
-            # constructs. Force parsing_method=regex to skip the lexer entirely.
+            # Unclosed region at EOF: rather than emit a half-parsed result, fall
+            # back to regex, which ignores the constructs that trip the lexer.
             templater_logger.warning(
                 "dataform lexer could not fully parse %s; "
-                "falling back to the regex parser.",
+                + "falling back to the regex parser.",
                 fname,
             )
             return self._find_template_blocks_by_regex(raw_str)
         elif parsing_method == "regex":
             return self._find_template_blocks_by_regex(raw_str)
-        elif parsing_method == "char":
-            return self._find_template_blocks_by_char(raw_str)
         else:
             raise SQLFluffUserError(
                 f"Invalid 'parsing_method' for dataform templater: {parsing_method}. "
-                + "Expected 'lexer', 'regex' or 'char'."
+                + "Expected 'lexer' or 'regex'."
             )
 
-    def _find_template_blocks_by_char(self, raw_str: str) -> list[BlockSpan]:
-        """
-        Uses a brace-counting parser to find all `${...}`, `js {...}`,
-        and `config {...}` blocks.
-        """
-        results: list[BlockSpan] = []
-
-        templater_logger.debug("Finding template blocks in raw string.")
-        starters: list[tuple[str, BlockType]] = [
-            ("post_operations {", BlockType.POST_OPERATIONS),
-            ("pre_operations {", BlockType.PRE_OPERATIONS),
-            ("config {", BlockType.CONFIG),
-            ("js {", BlockType.JS),
-            ("${", BlockType.TEMPLATED),
-        ]
-
-        stack = 0
-        outer_block_start = -1
-        inner_content_start = -1
-        block_type: Optional[BlockType] = None
-
-        i = 0
-        while i < len(raw_str):
-            # if we're not in a block, look for a starter sequence
-            if stack == 0:
-                # try to match js blocks first (higher priority)
-                matched = False
-                for test_prefix, prefix_block_type in starters:
-                    if raw_str.startswith(test_prefix, i):
-                        stack = 1
-                        block_type = prefix_block_type
-                        outer_block_start = i
-                        inner_content_start = i + len(test_prefix)
-                        # jump index past starter, -1 for the loop increment
-                        i += len(test_prefix) - 1
-                        matched = True
-                        break
-
-                if not matched and raw_str.startswith("input", i):
-                    input_match = re.match(r'input\s+"[^"]+"\s*\{', raw_str[i:])
-                    if input_match:
-                        stack = 1
-                        block_type = BlockType.INPUT
-                        outer_block_start = i
-                        matched_len = input_match.end()
-                        inner_content_start = i + matched_len
-                        i += matched_len - 1
-                        matched = True
-
-                if not matched:  # if no higher-priority block matched
-                    # check for SQL block comments /* ... */
-                    if raw_str.startswith("/*", i):
-                        outer_start = i
-                        comment_end_marker_idx = raw_str.find("*/", i + 2)
-
-                        if comment_end_marker_idx != -1:
-                            outer_end = comment_end_marker_idx + 2
-                        else:
-                            outer_end = len(raw_str)  # unclosed block comment
-
-                        results.append(
-                            BlockSpan(
-                                outer_start,
-                                outer_start,
-                                outer_end,
-                                outer_end,
-                                BlockType.SQL_BLOCK_COMMENT,
-                            )
-                        )
-                        # adjust for the i += 1 at the end of loop
-                        i = outer_end - 1
-
-                    # check for SQL line comments -- ...
-                    elif raw_str.startswith("--", i):
-                        outer_start = i
-                        newline_idx = raw_str.find("\n", i + 2)
-
-                        if newline_idx != -1:
-                            outer_end = newline_idx
-                        else:
-                            # Line comment goes to end of string
-                            outer_end = len(raw_str)
-
-                        results.append(
-                            BlockSpan(
-                                outer_start,
-                                outer_start,
-                                outer_end,
-                                outer_end,
-                                BlockType.SQL_LINE_COMMENT,
-                            )
-                        )
-                        # adjust for the i += 1 at the end of loop
-                        i = outer_end - 1
-
-            # if in a block, count all braces
-            else:
-                char = raw_str[i]
-                if char == "{":
-                    stack += 1
-                elif char == "}":
-                    stack -= 1
-                    if stack == 0:
-                        inner_content_end = i
-                        outer_block_end = i + 1
-                        assert block_type is not None
-                        results.append(
-                            BlockSpan(
-                                outer_block_start,
-                                inner_content_start,
-                                inner_content_end,
-                                outer_block_end,
-                                block_type,
-                            )
-                        )
-                        # reset for the next block
-                        block_type = None
-                        outer_block_start = -1
-            i += 1
-        templater_logger.debug(f"Found {len(results)} blocks.")
-        return results
-
-    def _find_template_blocks_by_lexer(self, raw_str: str) -> list[BlockSpan]:
-        """Blocks from the context-tracking lexer (see `_lex`)."""
-        return self._lex(raw_str)[0]
-
-    def _lex(self, raw_str: str) -> tuple[list[BlockSpan], bool]:
+    def _find_template_blocks_by_lexer(
+        self, raw_str: str
+    ) -> tuple[list[BlockSpan], bool]:
         """
         Finds `${...}`, `config`/`js`, `pre_operations`/`post_operations`,
-        `input` and comment blocks using a context-tracking lexer.
+        `input` and comment blocks (see the `_LEX_*` constants above).
 
-        Unlike the `regex` and `char` methods, this tracks lexical context (SQL
-        and JS strings, template literals, comments), so a brace, `${` or comment
-        marker that appears *inside* a string or comment cannot mis-terminate a
-        block. `${}` is templated at the top level and inside SQL string literals
-        (all quote flavors), but left verbatim inside comments and inside
-        `config`/`js`/`pre_operations`/`post_operations`/`input` blocks, matching
-        how Dataform interpolates the file.
+        Unlike the `regex` method, this tracks lexical context, so a
+        brace, `${` or comment marker inside a string or comment cannot
+        mis-terminate a block. `${}` is templated at the top level and inside SQL
+        string literals, but not inside comments or other blocks -- matching
+        `dataform compile`, which emits the SQL body as a JS template literal and
+        escapes `${` only inside comments.
 
-        Returns (blocks, balanced). `balanced` is False when the lexer reached EOF
-        with an unclosed region/string/template -- a signal it could not fully make
-        sense of the file (e.g. an escaped backtick in a template, or a JS regex
-        literal containing backticks). The caller falls back to the regex parser.
+        Constructs Dataform's lexer does not model are not modelled here either,
+        so we mis-slice where it does: JS regex literals (`js { const re = /}/; }`
+        ends inside the regex) and a bare `{` in an inner-SQL block (which does
+        not nest, so the block ends at the next `}`).
+
+        Returns (blocks, balanced). `balanced` is False if EOF was reached with an
+        unclosed region -- e.g. an escaped backtick in a template literal, which
+        Dataform cannot model either. The caller then falls back to regex.
         """
         results: list[BlockSpan] = []
         n = len(raw_str)
@@ -523,6 +399,7 @@ class DataformTemplaterFull(RawTemplater):
                         )
                         new_state = (
                             _LEX_JS
+                            # config/js bodies are JS; the rest are inner SQL.
                             if block_type in (BlockType.CONFIG, BlockType.JS)
                             else _LEX_INNER_SQL
                         )
@@ -544,7 +421,12 @@ class DataformTemplaterFull(RawTemplater):
                     continue
                 if c == "/" and nxt == "*":
                     idx = raw_str.find("*/", i + 2)
-                    end = n if idx == -1 else idx + 2
+                    if idx == -1:
+                        # No `*/`: ordinary text, not a comment to EOF -- which
+                        # would hide every later block.
+                        i += 1
+                        continue
+                    end = idx + 2
                     if suppress == 0:
                         results.append(
                             BlockSpan(i, i, end, end, BlockType.SQL_BLOCK_COMMENT)
@@ -556,13 +438,15 @@ class DataformTemplaterFull(RawTemplater):
                     i += 2
                     continue
                 if state == _LEX_INNER_SQL and c == "}":
+                    # A bare `{` does not nest here, so this always closes --
+                    # Dataform's behaviour, and where the regex finder disagrees.
                     _, region = stack.pop()
                     suppress -= 1
-                    if region is not None:
-                        block_type, outer_start, inner_start = region
-                        results.append(
-                            BlockSpan(outer_start, inner_start, i, i + 1, block_type)
-                        )
+                    assert region is not None
+                    block_type, outer_start, inner_start = region
+                    results.append(
+                        BlockSpan(outer_start, inner_start, i, i + 1, block_type)
+                    )
                     i += 1
                     continue
                 if c == "`":
@@ -596,7 +480,9 @@ class DataformTemplaterFull(RawTemplater):
                     continue
                 if c == "/" and nxt == "*":
                     idx = raw_str.find("*/", i + 2)
-                    i = n if idx == -1 else idx + 2
+                    # As in SQL state: no `*/` means ordinary text, so a later
+                    # `}` still closes the block.
+                    i = i + 1 if idx == -1 else idx + 2
                     continue
                 if c in ("'", '"'):
                     pattern = _LEX_JS_SINGLE_STR if c == "'" else _LEX_JS_DOUBLE_STR
@@ -636,7 +522,7 @@ class DataformTemplaterFull(RawTemplater):
                     i += 2
                     continue
                 if c == "`":
-                    stack.pop()
+                    _ = stack.pop()
                     i += 1
                     continue
                 i += 1
@@ -644,6 +530,9 @@ class DataformTemplaterFull(RawTemplater):
 
             # SQL string literals (single/double/triple). They differ only by
             # closing delimiter and which char is escapable, so drive from a table.
+            # `${}` is templated in every flavour, including double-quoted:
+            # Dataform's lexer misses that one, but its compiler still
+            # interpolates it, so we have to map it back.
             closer, extra_escape = _LEX_STR_INFO[state]
             if c == "\\" and (nxt == "\\" or nxt == extra_escape):
                 i += 2
@@ -653,7 +542,7 @@ class DataformTemplaterFull(RawTemplater):
                 i += 2
                 continue
             if raw_str.startswith(closer, i):
-                stack.pop()
+                _ = stack.pop()
                 i += len(closer)
                 continue
             i += 1
@@ -717,16 +606,16 @@ class DataformTemplaterFull(RawTemplater):
     def _copy_project_files_to_temp_dir(self, project_dir: Path, temp_dir: Path):
         """Copies necessary Dataform project files to the temp compilation directory."""
 
-        def copy_file(filename):
+        def copy_file(filename: str) -> None:
             copy_project_file = project_dir / filename
             if (copy_project_file).exists():
-                shutil.copy2(copy_project_file, temp_dir / filename)
+                _ = shutil.copy2(copy_project_file, temp_dir / filename)
                 templater_logger.debug(f"Copied {filename}")
 
-        def copy_dir(dirname):
+        def copy_dir(dirname: str) -> None:
             copy_project_dir = project_dir / dirname
             if copy_project_dir.exists():
-                shutil.copytree(copy_project_dir, temp_dir / dirname)
+                _ = shutil.copytree(copy_project_dir, temp_dir / dirname)
                 templater_logger.debug(f"Copied {dirname}/ directory")
 
         copy_file("package.json")
@@ -748,7 +637,7 @@ class DataformTemplaterFull(RawTemplater):
                 npm_executable = shutil.which("npm")
                 if not npm_executable:
                     raise FileNotFoundError("npm not found")
-                subprocess.run(
+                _ = subprocess.run(
                     [npm_executable, "install", "--production"],
                     cwd=temp_dir,
                     capture_output=True,
@@ -990,10 +879,11 @@ class DataformTemplaterFull(RawTemplater):
                 + f"tracked {current_source_pos} vs actual {len(in_str)}."
                 + " This might lead to inaccurate linting positions."
             )
-        if current_templated_pos != len(final_templated_str):
+        templated_len = len(final_templated_str)
+        if current_templated_pos != templated_len:
             templater_logger.warning(
-                f"Templated string length mismatch after slicing: "
-                f"tracked {current_templated_pos} vs actual {len(final_templated_str)}."
+                "Templated string length mismatch after slicing: "
+                + f"tracked {current_templated_pos} vs actual {templated_len}."
                 + " This might lead to inaccurate linting positions."
             )
         if next_compiled_marker_match:
@@ -1119,7 +1009,9 @@ class DataformTemplaterFull(RawTemplater):
         formatter: Optional[FormatterInterface] = None,
     ) -> tuple[TemplatedFile, list[SQLTemplaterError]]:
         """Annotate and process .sqlx file."""
-        if not self._sequenced_files:
+        # Only lint/fix call `sequence_files`; `sqlfluff parse` comes straight
+        # here, so a file outside the current batch needs a batch of its own.
+        if fname not in self._sequenced_files:
             self._sequenced_files = [fname]
             self._compilation_cache = {}
 
@@ -1162,6 +1054,12 @@ class DataformTemplaterFull(RawTemplater):
             )
 
         # retrieve compilation results from cache
+        if fname not in self._compilation_cache:
+            raise SQLTemplaterError(
+                f"No compilation result for {fname!r} after compiling "
+                + f"{len(self._sequenced_files)} file(s). This usually means the "
+                + "file is outside the configured 'project_dir'."
+            )
         all_blocks = self._compilation_cache[fname].blocks
         compiled_sql = self._compilation_cache[fname].compiled_sql
 

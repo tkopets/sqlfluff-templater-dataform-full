@@ -42,6 +42,10 @@ def _run_templater_and_verify_result(
         "no_template.sqlx",
         "sql_line_comment_ignored.sqlx",
         "sql_block_comment_ignored.sqlx",
+        # Both of these are mis-sliced by the `regex` finder; they cover the
+        # string/comment context tracking that `parsing_method = lexer` adds.
+        "string_with_comment_marker.sqlx",
+        "js_block_with_brace_in_string.sqlx",
         "pre_post_ops.sqlx",
         "incremental.sqlx",
         "assertion.sqlx",
@@ -64,3 +68,25 @@ def test__templater_dataform_templating_result(
         dataform_fluff_config=dataform_fluff_config,
         assets_temp_dir=assets_temp_dir,
     )
+
+
+def test__templater_handles_successive_files_without_sequencing(
+    project_dir: Path,
+    dataform_templater: RawTemplater,
+    dataform_fluff_config: ConfigMappingType,
+    assets_temp_dir: Path,
+):
+    """Successive files on one templater instance must each template correctly.
+
+    `sqlfluff parse` never calls `sequence_files`, so the templater sees one file
+    at a time on a shared instance. The second file used to raise a `KeyError`
+    because it recompiled the first file's batch and then missed itself.
+    """
+    for fname in ("config_query.sqlx", "no_template.sqlx"):
+        _run_templater_and_verify_result(
+            dataform_templater=dataform_templater,
+            project_dir=project_dir,
+            fname=fname,
+            dataform_fluff_config=dataform_fluff_config,
+            assets_temp_dir=assets_temp_dir,
+        )

@@ -1,0 +1,13 @@
+config {
+    type: "view"
+}
+
+js {
+    const label_value = 'string_with_comment_marker';
+}
+
+-- Each line below puts a comment marker inside a string literal, with a
+-- `${...}` after it on the same line. The marker is not a comment, so the
+-- placeholder must still be templated.
+select some_column, 'dashes -- inside a string' as lbl from ${ ref("table_a") }
+where some_column != '/* not a comment */' and some_column = '${ label_value }'
